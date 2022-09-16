@@ -33,6 +33,14 @@ namespace Microsoft
 {
     namespace IndirectDisp
     {
+        typedef struct _SharedFrameBufferHeader
+        {
+            SIZE_T MappedBufferLength;
+            SIZE_T FrameCount;
+            UINT8 FrameBufferIndex;
+            SIZE_T FrameBufferLength[2];
+        } SharedFrameBufferHeader, * PSharedFrameBufferHeader;
+
         /// <summary>
         /// Manages the creation and lifetime of a Direct3D render device.
         /// </summary>
@@ -65,6 +73,8 @@ namespace Microsoft
             void RunCore();
 
         public:
+            HANDLE m_hSharedBackBufferPixels;
+            PVOID m_pSharedBackBufferPixels;
             IDDCX_SWAPCHAIN m_hSwapChain;
             std::shared_ptr<Direct3DDevice> m_Device;
             HANDLE m_hAvailableBufferEvent;

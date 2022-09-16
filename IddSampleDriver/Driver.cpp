@@ -22,6 +22,8 @@ Environment:
 #include<string>
 #include<tuple>
 #include<vector>
+#include <D3DX11tex.h>
+#include <AclAPI.h>
 
 using namespace std;
 using namespace Microsoft::IndirectDisp;
@@ -122,6 +124,7 @@ void loadOptions(string filepath) {
     }
     monitorModes = res; return;
 }
+
 _Use_decl_annotations_
 NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 {
@@ -244,9 +247,41 @@ HRESULT Direct3DDevice::Init()
 #pragma region SwapChainProcessor
 
 SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent)
-    : m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent)
+    : m_hSharedBackBufferPixels(NULL), m_pSharedBackBufferPixels(NULL), m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent)
 {
     m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    
+    // Let's size the framebuffer big enough for 16:10 4K (that should fit most resolutions people want)
+    SIZE_T frameBufferSizeInBytes = 3840 * 2400 * sizeof(UINT32);
+
+    // We need space for the header, two framebuffer copies for front & backbuffer and some padding
+    SIZE_T mappedBufferSizeInBytes = sizeof(SharedFrameBufferHeader) + (2 * frameBufferSizeInBytes) + (64 * 1024);
+
+    // Create a new shared backbuffer
+    m_hSharedBackBufferPixels = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)mappedBufferSizeInBytes, "Global\\IddSampleDriverFrameBuffer");
+
+    // We successfully created a new shared backbuffer
+    if (m_hSharedBackBufferPixels != NULL)
+    {
+        // Make the handle public
+        SetSecurityInfo(m_hSharedBackBufferPixels, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL);
+
+        // Map the shared backbuffer
+        m_pSharedBackBufferPixels = (LPTSTR)MapViewOfFile(m_hSharedBackBufferPixels, FILE_MAP_ALL_ACCESS, 0, 0, mappedBufferSizeInBytes);
+
+        // We managed to map the shared backbuffer
+        if (m_pSharedBackBufferPixels != NULL)
+        {
+            // Initialize the header
+            PSharedFrameBufferHeader newFrameBufferHeader = (PSharedFrameBufferHeader)m_pSharedBackBufferPixels;
+            newFrameBufferHeader->MappedBufferLength = mappedBufferSizeInBytes;
+            newFrameBufferHeader->FrameCount = 0;
+            newFrameBufferHeader->FrameBufferIndex = 0;
+            newFrameBufferHeader->FrameBufferLength[0] = 0;
+            newFrameBufferHeader->FrameBufferLength[1] = 0;
+        }
+    }
+
 
     // Immediately create and run the swap-chain processing thread, passing 'this' as the thread parameter
     m_hThread.Attach(CreateThread(nullptr, 0, RunThread, this, 0, nullptr));
@@ -306,6 +341,14 @@ void SwapChainProcessor::RunCore()
         return;
     }
 
+    // Cast the frame header
+    PSharedFrameBufferHeader frameBufferHeader = (PSharedFrameBufferHeader)m_pSharedBackBufferPixels;
+
+    // The shared front & backbuffer
+    LPVOID sharedFrameBuffer[2];
+    sharedFrameBuffer[0] = (LPVOID)&frameBufferHeader[1];
+    sharedFrameBuffer[1] = (LPVOID)(((PUCHAR)sharedFrameBuffer[0]) + ((frameBufferHeader->MappedBufferLength - sizeof(SharedFrameBufferHeader) - (64 * 1024)) / 2));
+
     // Acquire and release buffers in a loop
     for (;;)
     {
@@ -356,6 +399,46 @@ void SwapChainProcessor::RunCore()
             //  * a GPU VPBlt to another surface
             //  * a GPU custom compute shader encode operation
             // ==============================
+
+            // Cast the monitor backbuffer
+            ID3D11Texture2D* backBuffer = NULL;
+            if (NT_SUCCESS(Buffer.MetaData.pSurface->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer))))
+            {
+                // Reference the device context
+                ID3D11DeviceContext* deviceContext = m_Device->DeviceContext.Get();
+
+                // Save the framebuffer into a shared in-memory DDS file
+                ID3D10Blob* savedFrame = NULL;
+                if (NT_SUCCESS(D3DX11SaveTextureToMemory(deviceContext, backBuffer, D3DX11_IFF_DDS, &savedFrame, 0)) && savedFrame != NULL)
+                {
+                    // Get the active buffer index
+                    UINT8 frameBufferIndex = frameBufferHeader->FrameBufferIndex;
+
+                    // Reset the frame buffer size (to prevent early polling)
+                    frameBufferHeader->FrameBufferLength[frameBufferIndex] = 0;
+
+                    // Get the frame buffer length
+                    SIZE_T frameBufferLength = savedFrame->GetBufferSize();
+
+                    // Copy the frame buffer
+                    CopyMemory(sharedFrameBuffer[frameBufferIndex], savedFrame->GetBufferPointer(), frameBufferLength);
+
+                    // Set the frame buffer length
+                    frameBufferHeader->FrameBufferLength[frameBufferIndex] = frameBufferLength;
+
+                    // Increment the frame counter
+                    frameBufferHeader->FrameCount++;
+
+                    // Release the saved frame
+                    savedFrame->Release();
+                }
+
+                // Release the device context
+                deviceContext->Release();
+
+                // Release the monitor backbuffer
+                backBuffer->Release();
+            }
 
             AcquiredBuffer.Reset();
             hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
